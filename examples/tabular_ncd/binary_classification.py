@@ -118,18 +118,8 @@ def ensure_data_preprocessed(agent_name: str) -> None:
     logging.info(f"  - Features: {meta['n_features_transformed']}")
     logging.info(f"  - Train samples: {meta['train_samples']}")
 
+
 # ============ Funciones Helper ============
-
-def _models_dir() -> str:
-    """Directorio para guardar modelos y métricas"""
-    global MODELS_DIR
-    if MODELS_DIR is None:
-        base = os.path.dirname(os.path.abspath(__file__))
-        d = os.path.join(base, "data", "models")
-        os.makedirs(d, exist_ok=True)
-        MODELS_DIR = d
-    return MODELS_DIR
-
 
 def save_models_npz(models: Dict[str, np.ndarray], tag: str, agent_name: str = 'a1') -> str:
     """
