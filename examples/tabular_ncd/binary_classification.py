@@ -149,22 +149,46 @@ def _metrics_csv_path(dataset_tag: str = "ncd_dataset1", agent_name: str = 'a1')
     return os.path.join(_models_dir(agent_name), f"metrics_{dataset_tag}.csv")
 
 
-def log_metrics_csv(round_idx: int, kind: str, val_acc: float, test_acc: float,
+def log_metrics_csv(round_idx: int, kind: str, 
+                    global_acc: float, local_acc: float,
+                    global_recall: float, local_recall: float,
+                    num_messages: int, bytes_global: int, bytes_local: int,
+                    bytes_round_total: int, bytes_cumulative: int,
+                    latency_wait_global: float, round_time: float,
                     dataset_tag: str = "ncd_dataset1", agent_name: str = 'a1') -> None:
     """
-    Registra métricas en CSV para análisis posterior.
+    Registra métricas completas en CSV para análisis posterior.
     
     Args:
         round_idx: Número de ronda
-        kind: 'local' o 'global'
-        val_acc: Accuracy en validation set
-        test_acc: Accuracy en test set
-        dataset_tag: Tag del dataset (para múltiples experimentos)
+        kind: 'global' o 'local'
+        global_acc: Accuracy global
+        local_acc: Accuracy local
+        global_recall: Recall global calculado
+        local_recall: Recall local
+        num_messages: Número de mensajes intercambiados
+        bytes_global: Bytes del modelo global
+        bytes_local: Bytes del modelo local
+        bytes_round_total: Total de bytes en la ronda
+        bytes_cumulative: Bytes acumulados
+        latency_wait_global: Latencia esperando modelo global
+        round_time: Tiempo total de la ronda
+        dataset_tag: Tag del dataset
         agent_name: Nombre del agente
     """
     csv_path = _metrics_csv_path(dataset_tag, agent_name)
-    header = ["timestamp", "round", "kind", "val_acc", "test_acc"]
-    row = [time.strftime("%Y-%m-%d %H:%M:%S"), round_idx, kind, val_acc, test_acc]
+    header = ["timestamp", "round", "global_accuracy", "local_accuracy", 
+              "global_recall", "local_recall",
+              "num_messages", "bytes_global", "bytes_local", 
+              "bytes_round_total", "bytes_cumulative",
+              "latency_wait_global", "round_time"]
+    
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]  # ISO format con milisegundos
+    row = [timestamp, round_idx, global_acc, local_acc, 
+           global_recall, local_recall,
+           num_messages, bytes_global, bytes_local,
+           bytes_round_total, bytes_cumulative,
+           latency_wait_global, round_time]
     
     write_header = not os.path.exists(csv_path)
     with open(csv_path, "a", newline="") as f:
@@ -348,6 +372,45 @@ def _eval_split(models: Dict[str, np.ndarray], split: str, agent_name: str = 'a1
     return accuracy
 
 
+def _eval_recall(models: Dict[str, np.ndarray], split: str, agent_name: str = 'a1') -> float:
+    """
+    Calcula el recall del modelo en un split específico.
+    Recall = TP / (TP + FN) - útil para detectar casos positivos.
+    
+    Args:
+        models: Diccionario con parámetros del modelo
+        split: 'val' o 'test'
+        agent_name: Nombre del agente (para cargar datos correctos)
+    
+    Returns:
+        float: Recall en el split
+    """
+    conv = Converter.cvtr()
+    net = conv.convert_dict_nparray_to_nn(models)
+    net.eval()
+    
+    dm = DataManager.dm(agent_name=agent_name)
+    loader = dm.valloader if split == "val" else dm.testloader
+    
+    true_positives = 0
+    false_negatives = 0
+    
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            logits = net(X_batch)
+            probs = torch.sigmoid(logits)
+            preds = (probs >= 0.5).long().squeeze()
+            y_true = y_batch.long()
+            
+            # Calcular TP y FN
+            true_positives += ((preds == 1) & (y_true == 1)).sum().item()
+            false_negatives += ((preds == 0) & (y_true == 1)).sum().item()
+    
+    # Recall = TP / (TP + FN)
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+    return recall
+
+
 # -------------------------- Main Loop --------------------------
 
 if __name__ == "__main__":
@@ -367,9 +430,10 @@ if __name__ == "__main__":
     # Verificar y preprocesar datos si es necesario
     ensure_data_preprocessed(agent_name)
 
-    # Inicializar Judge para early stopping
-    # Ajustar max_rounds, patience, min_delta según necesidades
-    judge = Judge(max_rounds=50, patience=5, min_delta=1e-4)
+    # Inicializar Judge para early stopping basado en recall
+    # - max_rounds=50: Límite absoluto de 50 rondas
+    # - patience=20: Para si no mejora recall en 20 rondas consecutivas
+    judge = Judge(max_rounds=50, patience=20, min_delta=1e-4)
 
     # Preparar modelo inicial
     logging.info("\n--- Inicializando modelos ---")
@@ -382,62 +446,139 @@ if __name__ == "__main__":
     # Iniciar threads del cliente FL
     fl_client.start_fl_client()
 
-    # Contadores
+    # Contadores y métricas de comunicación
     training_count = 0
     gm_arrival_count = 0
     dataset_tag = f"{DATASET_TAG}_{agent_name}"
+    bytes_cumulative = 0  # Bytes acumulados a lo largo de todas las rondas
+    
+    # Métricas de recall para agregación
+    local_recalls = []  # Lista de recalls locales de todos los agentes
 
     logging.info("\n" + "=" * 60)
     logging.info("Iniciando Loop Principal de Federated Learning")
     logging.info("=" * 60)
 
     while True:
+        round_start_time = time.time()  # Inicio de la ronda
+        
         # ========== 1. Esperar modelo global ==========
         logging.info(f"\n[Round {gm_arrival_count + 1}] Esperando modelo global...")
+        wait_start = time.time()
         global_models = fl_client.wait_for_global_model()
+        latency_wait_global = time.time() - wait_start
+        
         gm_arrival_count += 1
         
-        logging.info(f"✓ Modelo global recibido (Round {gm_arrival_count})")
+        logging.info(f"✓ Modelo global recibido (Round {gm_arrival_count}) - Latencia: {latency_wait_global:.4f}s")
         save_models_npz(global_models, f"global_r{gm_arrival_count}", agent_name)
+        
+        # Calcular tamaño del modelo global en bytes
+        import pickle
+        bytes_global = len(pickle.dumps(global_models))
 
         # ========== 2. Evaluar modelo global ==========
-        logging.info("Evaluando modelo global...")
-        acc_val_g = _eval_split(global_models, "val", agent_name)
-        acc_tst_g = _eval_split(global_models, "test", agent_name)
+        logging.info("Evaluando modelo global (accuracy + recall)...")
+        acc_global = _eval_split(global_models, "test", agent_name)
+        recall_global_local = _eval_recall(global_models, "test", agent_name)  # Recall calculado localmente
         
-        print(f"[Global Model] Val Acc: {100*acc_val_g:.2f}% | Test Acc: {100*acc_tst_g:.2f}%")
-        log_metrics_csv(gm_arrival_count, "global", acc_val_g, acc_tst_g, dataset_tag, agent_name)
+        # TODO: En un sistema real, aquí se recibirían los recalls de todos los agentes
+        # y se calcularía el recall global promedio. Por ahora usamos el recall local.
+        global_recall = recall_global_local  # Simplificación: recall global = recall local
+        
+        print(f"[Global Model] Accuracy: {100*acc_global:.2f}% | Recall: {100*global_recall:.2f}%")
 
-        # ========== 3. Verificar criterio de parada ==========
-        should_continue = judge.update_and_should_continue(gm_arrival_count, val_acc=acc_val_g)
+        # ========== 3. Verificar criterio de parada (basado en recall global) ==========
+        should_continue = judge.update_and_should_continue(gm_arrival_count, global_recall=global_recall)
         if not should_continue:
             logging.info("\n" + "=" * 60)
             logging.info("✓ Criterio de parada satisfecho (Judge)")
             logging.info("=" * 60)
+            
+            # Registrar última ronda antes de salir
+            round_time = time.time() - round_start_time
+            bytes_round_total = bytes_global
+            bytes_cumulative += bytes_round_total
+            
+            log_metrics_csv(
+                round_idx=gm_arrival_count,
+                kind="final_global",
+                global_acc=acc_global,
+                local_acc=0.0,  # No hay modelo local en la última iteración
+                global_recall=global_recall,
+                local_recall=0.0,
+                num_messages=1,  # Solo recepción del modelo global
+                bytes_global=bytes_global,
+                bytes_local=0,
+                bytes_round_total=bytes_round_total,
+                bytes_cumulative=bytes_cumulative,
+                latency_wait_global=latency_wait_global,
+                round_time=round_time,
+                dataset_tag=dataset_tag,
+                agent_name=agent_name
+            )
             break
 
         # ========== 4. Entrenamiento local ==========
         logging.info("\n--- Iniciando entrenamiento local ---")
+        train_start = time.time()
         models = training(global_models, agent_name=agent_name)
         training_count += 1
+        train_time = time.time() - train_start
+        
         save_models_npz(models, f"local_r{training_count}", agent_name)
+        logging.info(f"✓ Entrenamiento completado en {train_time:.2f}s")
 
         # ========== 5. Evaluar modelo local ==========
-        logging.info("Evaluando modelo local...")
-        acc_val_l = _eval_split(models, "val", agent_name)
-        acc_tst_l = _eval_split(models, "test", agent_name)
+        logging.info("Evaluando modelo local (accuracy + recall)...")
+        acc_local = _eval_split(models, "test", agent_name)
+        recall_local = _eval_recall(models, "test", agent_name)
         
-        print(f"[Local Model]  Val Acc: {100*acc_val_l:.2f}% | Test Acc: {100*acc_tst_l:.2f}%")
-        log_metrics_csv(training_count, "local", acc_val_l, acc_tst_l, dataset_tag, agent_name)
+        print(f"[Local Model]  Accuracy: {100*acc_local:.2f}% | Recall: {100*recall_local:.2f}%")
 
         # ========== 6. Enviar modelo entrenado ==========
         logging.info("Enviando modelo local al agregador...")
+        
+        # Calcular tamaño del modelo local
+        bytes_local = len(pickle.dumps(models))
+        
         fl_client.send_trained_model(
             models, 
             int(TrainingMetaData.num_training_data), 
-            acc_val_l
+            recall_local  # Enviar recall local en lugar de accuracy
         )
         logging.info("✓ Modelo local enviado")
+        
+        # ========== 7. Calcular métricas de la ronda ==========
+        round_time = time.time() - round_start_time
+        
+        # Métricas de comunicación
+        num_messages = 2  # 1 recepción (global) + 1 envío (local)
+        bytes_round_total = bytes_global + bytes_local
+        bytes_cumulative += bytes_round_total
+        
+        logging.info(f"📊 Ronda {gm_arrival_count} completada en {round_time:.2f}s")
+        logging.info(f"   - Bytes global: {bytes_global:,} | Bytes local: {bytes_local:,} | Total: {bytes_round_total:,}")
+        logging.info(f"   - Bytes acumulados: {bytes_cumulative:,}")
+        
+        # ========== 8. Registrar métricas en CSV ==========
+        log_metrics_csv(
+            round_idx=gm_arrival_count,
+            kind="training",
+            global_acc=acc_global,
+            local_acc=acc_local,
+            global_recall=global_recall,
+            local_recall=recall_local,
+            num_messages=num_messages,
+            bytes_global=bytes_global,
+            bytes_local=bytes_local,
+            bytes_round_total=bytes_round_total,
+            bytes_cumulative=bytes_cumulative,
+            latency_wait_global=latency_wait_global,
+            round_time=round_time,
+            dataset_tag=dataset_tag,
+            agent_name=agent_name
+        )
 
     # ========== Finalización ==========
     logging.info("\n" + "=" * 60)
@@ -452,5 +593,6 @@ if __name__ == "__main__":
     logging.info("=" * 60)
     logging.info(f"Total de rondas globales: {gm_arrival_count}")
     logging.info(f"Total de entrenamientos locales: {training_count}")
+    logging.info(f"Total de bytes transferidos: {bytes_cumulative:,} ({bytes_cumulative/(1024*1024):.2f} MB)")
     logging.info(f"Métricas guardadas en: {_metrics_csv_path(dataset_tag, agent_name)}")
     logging.info(f"Modelos guardados en: {_models_dir(agent_name)}")
